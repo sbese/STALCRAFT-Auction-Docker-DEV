@@ -25,22 +25,16 @@ if not User.objects.filter(username=username).exists():
     User.objects.create_superuser(username=username, password=password)
 PY
 
-# Запускаем celery worker в фоне
-CELERY_WORKER_LOG_FILE=${CELERY_WORKER_LOG_FILE:-/tmp/celery_worker.log}
-CELERY_BEAT_LOG_FILE=${CELERY_BEAT_LOG_FILE:-/tmp/celery_beat.log}
+# Сборщик истории стартует фоновым потоком внутри веб-процесса (auction/taskrunner.py).
+# Переменная выставляется только здесь, чтобы manage.py-команды выше его не запускали.
+export COLLECTOR_AUTOSTART=${COLLECTOR_AUTOSTART:-1}
 
-celery -A scaw worker -l INFO --logfile="$CELERY_WORKER_LOG_FILE" &
-WORKER_PID=$! # Сохраняем PID этого процесса
-
-# Запускаем celery beat в фоне
-celery -A scaw beat -l INFO --logfile="$CELERY_BEAT_LOG_FILE" &
-BEAT_PID=$! # Сохраняем PID этого процесса
-
-# python manage.py collectstatic --noinput
-# python manage.py collectstatic --noinput --clear
-python manage.py runserver 0.0.0.0:8000
-# gunicorn scaw.wsgi:application --bind 0.0.0.0:8000
-
-
-# Когда контейнер завершается, убиваем оба процесса по их PID
-trap "kill $WORKER_PID $BEAT_PID" EXIT
+# На Render (или при USE_GUNICORN=1) запускаем прод-сервер.
+# ВАЖНО: ровно 1 worker - раннер фоновых задач живет внутри процесса,
+# несколько воркеров запустят несколько сборщиков.
+if [ -n "$RENDER" ] || [ "$USE_GUNICORN" = "1" ]; then
+    python manage.py collectstatic --noinput
+    exec gunicorn scaw.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 8 --timeout 120
+else
+    exec python manage.py runserver 0.0.0.0:8000
+fi

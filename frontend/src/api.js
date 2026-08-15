@@ -95,26 +95,26 @@ export async function authLogout() {
   })
 }
 
-export async function fetchCeleryOverview() {
-  return request('/admin/celery/overview/', {}, 30000)
+export async function fetchTasksOverview() {
+  return request('/admin/tasks/overview/', {}, 30000)
 }
 
-export async function fetchCeleryLogs(source = 'app', lines = 80) {
-  return request(`/admin/celery/logs/?source=${encodeURIComponent(source)}&lines=${lines}`, {}, 30000)
+export async function fetchTaskLogs(source = 'app', lines = 80) {
+  return request(`/admin/tasks/logs/?source=${encodeURIComponent(source)}&lines=${lines}`, {}, 30000)
 }
 
-export async function startCeleryTask(taskName, args = [], kwargs = {}) {
-  return request('/admin/celery/tasks/start/', {
+export async function startBackgroundTask(taskName) {
+  return request('/admin/tasks/start/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task_name: taskName, args, kwargs }),
+    body: JSON.stringify({ task_name: taskName }),
   })
 }
 
-export async function stopCeleryTask(taskId, terminate = true, signal = 'SIGTERM') {
-  return request('/admin/celery/tasks/stop/', {
+export async function stopBackgroundTask(taskId) {
+  return request('/admin/tasks/stop/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task_id: taskId, terminate, signal }),
+    body: JSON.stringify({ task_id: taskId }),
   })
 }

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import StatusLamp from '../components/StatusLamp'
 import { useNavigate } from 'react-router-dom'
-import { authLogin, authLogout, authMe, fetchCeleryOverview } from '../api'
+import { authLogin, authLogout, authMe, fetchTasksOverview } from '../api'
 import AdminLoginPanel from '../components/AdminLoginPanel'
 
 const ADMIN_AUTH_FLAG_KEY = 'admin-authenticated'
@@ -26,7 +26,7 @@ function AdminPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' })
   const [loginError, setLoginError] = useState('')
 
-  const [overview, setOverview] = useState({ workers: [], running_tasks: [], pending_tasks: [], manual_tasks: [] })
+  const [overview, setOverview] = useState({ collector: null, running_tasks: [], schedule: [], manual_tasks: [] })
   const [overviewLoading, setOverviewLoading] = useState(true)
   // null — статус ещё не получен, иначе: 'success', 'timeout', 'error'
   const [overviewStatus, setOverviewStatus] = useState(null)
@@ -34,28 +34,10 @@ function AdminPage() {
 
   const isAdmin = authState.authenticated && authState.is_staff
   const accessLevel = authState.is_superuser ? 'Superuser' : 'Staff'
-  const workersOnline = useMemo(() => {
-    const directWorkers = Array.isArray(overview.workers) ? overview.workers.length : 0
-    const registeredWorkers = overview.registered_tasks && typeof overview.registered_tasks === 'object'
-      ? Object.keys(overview.registered_tasks).length
-      : 0
-    const statsWorkers = overview.stats && typeof overview.stats === 'object'
-      ? Object.keys(overview.stats).length
-      : 0
-
-    return Math.max(directWorkers, registeredWorkers, statsWorkers)
-  }, [overview])
-  const periodicCount = (overview.beat_schedule || []).length
+  const collectorAlive = Boolean(overview.collector?.alive)
+  const periodicCount = (overview.schedule || []).length
   // Для лампочки статуса: null (ещё не было ответа) — серый, иначе последний статус
   const displayedOverviewStatus = overviewStatus ?? 'none'
-  const scheduledCount = useMemo(
-    () => (overview.pending_tasks || []).filter((task) => task.state === 'scheduled').length,
-    [overview]
-  )
-  const reservedCount = useMemo(
-    () => (overview.pending_tasks || []).filter((task) => task.state === 'reserved').length,
-    [overview]
-  )
 
   useEffect(() => {
     let isActive = true
@@ -102,15 +84,10 @@ function AdminPage() {
     const fetchOverview = async () => {
       try {
         setOverviewLoading(true)
-        const data = await fetchCeleryOverview()
+        const data = await fetchTasksOverview()
         if (!isActive) return
         setOverview(data)
-        if (data.celery_error) {
-          console.error('[AdminPage] Celery overview error:', data.celery_error)
-          setOverviewStatus(data.celery_error.toLowerCase().includes('timeout') ? 'timeout' : 'error')
-        } else {
-          setOverviewStatus('success')
-        }
+        setOverviewStatus('success')
         hasOverviewLoadedRef.current = true
         setOverviewLoading(false)
       } catch (error) {
@@ -119,9 +96,9 @@ function AdminPage() {
         setOverviewStatus(message.toLowerCase().includes('timeout') ? 'timeout' : 'error')
         setOverviewLoading(false)
         if (message.toLowerCase().includes('timeout')) {
-          console.error('[AdminPage] Celery overview request failed: Request timeout')
+          console.error('[AdminPage] Tasks overview request failed: Request timeout')
         } else {
-          console.error('[AdminPage] Celery overview request failed:', message)
+          console.error('[AdminPage] Tasks overview request failed:', message)
         }
       } finally {
         if (!isActive) return
@@ -195,13 +172,13 @@ function AdminPage() {
 
         <div className="col">
           <div className="glass-panel p-3 h-100 d-flex flex-column">
-            <h6 className="panel-title mb-2">Celery Tasks</h6>
-            <div className="small text-secondary mb-3">Мониторинг воркеров, запуск и остановка задач, просмотр логов.</div>
+            <h6 className="panel-title mb-2">Фоновые задачи</h6>
+            <div className="small text-secondary mb-3">Сборщик истории, запуск и остановка задач, просмотр логов.</div>
             <div className="d-flex justify-content-between align-items-start gap-2 mb-3">
               <div>
-                <div className="small text-secondary">Workers online: {workersOnline}</div>
+                <div className="small text-secondary">Сборщик: {collectorAlive ? 'работает' : 'остановлен'}</div>
                 <div className="small text-secondary">Running: {overview.running_tasks?.length || 0}</div>
-                <div className="small text-secondary">Pending: {overview.pending_tasks?.length || 0}</div>
+                <div className="small text-secondary">Циклов: {overview.collector?.cycles_completed ?? 0}</div>
               </div>
               <div className="d-flex align-items-center gap-2">
                 {/* Статус последней загрузки */}
@@ -213,7 +190,7 @@ function AdminPage() {
             <button
               type="button"
               className="btn btn-sm btn-accent mt-auto"
-              onClick={() => navigate('/control-center/celery-tasks')}
+              onClick={() => navigate('/control-center/tasks')}
             >
               Открыть
             </button>
@@ -222,13 +199,12 @@ function AdminPage() {
 
         <div className="col">
           <div className="glass-panel p-3 h-100 d-flex flex-column">
-            <h6 className="panel-title mb-2">Celery Scheduler</h6>
-            <div className="small text-secondary mb-3">Просмотр и отмена запланированных/ожидающих задач.</div>
+            <h6 className="panel-title mb-2">Планировщик</h6>
+            <div className="small text-secondary mb-3">Расписание периодических задач через внешний cron.</div>
             <div className="d-flex justify-content-between align-items-start gap-2 mb-3">
               <div>
                 <div className="small text-secondary">Periodic: {periodicCount}</div>
-                <div className="small text-secondary">Scheduled: {scheduledCount}</div>
-                <div className="small text-secondary">Reserved: {reservedCount}</div>
+                <div className="small text-secondary">Running: {overview.running_tasks?.length || 0}</div>
               </div>
               <div className="d-flex align-items-center gap-2">
                 <StatusLamp type="status" value={displayedOverviewStatus} />
@@ -238,7 +214,7 @@ function AdminPage() {
             <button
               type="button"
               className="btn btn-sm btn-accent mt-auto"
-              onClick={() => navigate('/control-center/celery-scheduler')}
+              onClick={() => navigate('/control-center/scheduler')}
             >
               Открыть
             </button>

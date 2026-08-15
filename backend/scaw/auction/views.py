@@ -1,4 +1,5 @@
 import datetime
+import hmac
 import json
 import os
 from django.db import connection, models
@@ -11,18 +12,36 @@ from django.core.paginator import Paginator
 from django.shortcuts import get_object_or_404
 from django.conf import settings
 
-from scaw.celery import app as celery_app
 from .models import SaleHistory, Item
 from .constants import RANK_COLORS
+from .taskrunner import COLLECTOR_TASK_NAME, runner
 
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 2000
-ALLOWED_MANUAL_TASKS = {
-    'auction.tasks.sync_github_items_daily',
-    'auction.tasks.delete_old_sales',
-    'auction.tasks.start_get_history',
-}
+
+# Периодические запуски выполняет внешний cron (например, cron-job.org),
+# дергая /auction/api/cron/<task>/?token=<CRON_SECRET> по этому расписанию.
+SCHEDULE_HINTS = [
+    {
+        'name': 'sync-github-items-everyday',
+        'task': 'sync_github_items_daily',
+        'cron': '0 16 * * *',
+        'description': 'Ежедневная синхронизация предметов из GitHub (16:00 UTC).',
+    },
+    {
+        'name': 'delete-old-sales-weekly',
+        'task': 'delete_old_sales',
+        'cron': '0 3 * * 1',
+        'description': 'Еженедельное удаление старых продаж (понедельник, 03:00 UTC).',
+    },
+    {
+        'name': 'keep-alive-and-collector',
+        'task': COLLECTOR_TASK_NAME,
+        'cron': '*/10 * * * *',
+        'description': 'Пинг каждые 10 минут: не дает бесплатному инстансу заснуть и перезапускает сборщик, если он упал.',
+    },
+]
 
 
 def _serialize_item(item):
@@ -173,148 +192,74 @@ def api_auth_logout(request):
 
 
 @require_GET
-def api_admin_celery_overview(request):
+def api_admin_tasks_overview(request):
     denied = _ensure_staff(request)
     if denied:
         return denied
 
-    active = {}
-    reserved = {}
-    scheduled = {}
-    registered = {}
-    stats = {}
-    celery_error = None
-
-    try:
-        inspector = celery_app.control.inspect(timeout=1.0)
-        active = inspector.active() or {}
-        reserved = inspector.reserved() or {}
-        scheduled = inspector.scheduled() or {}
-        registered = inspector.registered() or {}
-        stats = inspector.stats() or {}
-    except Exception as exc:
-        celery_error = str(exc)
-
-    workers = sorted(set(active.keys()) | set(reserved.keys()) | set(scheduled.keys()) | set(stats.keys()))
-
-    running_tasks = []
-    for worker_name, worker_tasks in active.items():
-        for task in worker_tasks:
-            running_tasks.append(
-                {
-                    'worker': worker_name,
-                    'id': task.get('id'),
-                    'name': task.get('name'),
-                    'args': task.get('args'),
-                    'kwargs': task.get('kwargs'),
-                    'time_start': task.get('time_start'),
-                }
-            )
-
-    pending_tasks = []
-    for worker_name, worker_tasks in reserved.items():
-        for task in worker_tasks:
-            pending_tasks.append(
-                {
-                    'worker': worker_name,
-                    'id': task.get('id'),
-                    'name': task.get('name'),
-                    'args': task.get('args'),
-                    'kwargs': task.get('kwargs'),
-                    'state': 'reserved',
-                }
-            )
-
-    for worker_name, worker_tasks in scheduled.items():
-        for task in worker_tasks:
-            request_data = task.get('request', {})
-            pending_tasks.append(
-                {
-                    'worker': worker_name,
-                    'id': request_data.get('id'),
-                    'name': request_data.get('name'),
-                    'args': request_data.get('args'),
-                    'kwargs': request_data.get('kwargs'),
-                    'eta': task.get('eta'),
-                    'state': 'scheduled',
-                }
-            )
-
-    beat_schedule = []
-    beat_schedule_raw = celery_app.conf.beat_schedule or {}
-    for name, entry in beat_schedule_raw.items():
-        beat_schedule.append(
-            {
-                'name': name,
-                'task': entry.get('task'),
-                'schedule': str(entry.get('schedule')),
-                'args': entry.get('args', []),
-                'kwargs': entry.get('kwargs', {}),
-            }
-        )
-
-    beat_schedule.sort(key=lambda item: item['name'])
-
     return JsonResponse(
         {
-            'workers': workers,
-            'running_tasks': running_tasks,
-            'pending_tasks': pending_tasks,
-            'beat_schedule': beat_schedule,
-            'registered_tasks': registered,
-            'stats': stats,
-            'manual_tasks': sorted(ALLOWED_MANUAL_TASKS),
-            'celery_available': celery_error is None,
-            'celery_error': celery_error,
+            'collector': runner.collector_status(),
+            'running_tasks': runner.running_tasks(),
+            'manual_tasks': runner.manual_task_names(),
+            'collector_task_name': COLLECTOR_TASK_NAME,
+            'schedule': SCHEDULE_HINTS,
+            'cron_url_template': '/auction/api/cron/<task>/?token=<CRON_SECRET>',
+            'log_sources': ['app'],
         }
     )
 
 
 @csrf_exempt
 @require_POST
-def api_admin_celery_start_task(request):
+def api_admin_tasks_start(request):
     denied = _ensure_staff(request)
     if denied:
         return denied
 
     body = _get_json_body(request)
     task_name = body.get('task_name')
-    args = body.get('args', [])
-    kwargs = body.get('kwargs', {})
 
-    if task_name not in ALLOWED_MANUAL_TASKS:
+    if task_name != COLLECTOR_TASK_NAME and task_name not in runner.get_registry():
         return JsonResponse({'detail': 'Task is not allowed for manual start'}, status=400)
 
-    if not isinstance(args, list) or not isinstance(kwargs, dict):
-        return JsonResponse({'detail': 'Invalid args or kwargs payload'}, status=400)
+    result = runner.start_task(task_name)
 
-    result = celery_app.send_task(task_name, args=args, kwargs=kwargs)
-
-    return JsonResponse({'ok': True, 'task_id': result.id, 'task_name': task_name})
+    return JsonResponse(
+        {
+            'ok': True,
+            'task_id': result['task']['id'],
+            'task_name': task_name,
+            'already_running': result['already_running'],
+        }
+    )
 
 
 @csrf_exempt
 @require_POST
-def api_admin_celery_stop_task(request):
+def api_admin_tasks_stop(request):
     denied = _ensure_staff(request)
     if denied:
         return denied
 
     body = _get_json_body(request)
     task_id = body.get('task_id')
-    terminate = bool(body.get('terminate', True))
-    signal_name = body.get('signal', 'SIGTERM')
 
     if not task_id:
         return JsonResponse({'detail': 'task_id is required'}, status=400)
 
-    celery_app.control.revoke(task_id, terminate=terminate, signal=signal_name)
+    try:
+        task = runner.stop_task(task_id)
+    except KeyError:
+        return JsonResponse({'detail': 'Task not found'}, status=404)
+    except ValueError:
+        return JsonResponse({'detail': 'Task does not support stopping'}, status=400)
 
-    return JsonResponse({'ok': True, 'task_id': task_id, 'terminate': terminate})
+    return JsonResponse({'ok': True, 'task_id': task['id'], 'task_name': task['name']})
 
 
 @require_GET
-def api_admin_celery_logs(request):
+def api_admin_tasks_logs(request):
     denied = _ensure_staff(request)
     if denied:
         return denied
@@ -329,8 +274,6 @@ def api_admin_celery_logs(request):
 
     log_map = {
         'app': os.path.join(settings.BASE_DIR, 'logs.log'),
-        'worker': os.getenv('CELERY_WORKER_LOG_FILE', '/tmp/celery_worker.log'),
-        'beat': os.getenv('CELERY_BEAT_LOG_FILE', '/tmp/celery_beat.log'),
     }
 
     selected_path = log_map.get(source)
@@ -345,6 +288,51 @@ def api_admin_celery_logs(request):
             'path': selected_path,
             'lines': content,
             'exists': os.path.exists(selected_path),
+        }
+    )
+
+
+@require_GET
+def api_health(request):
+    """Health-check для мониторинга и keep-alive пингов бесплатного хостинга."""
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'collector_alive': runner.collector_status()['alive'],
+        }
+    )
+
+
+@csrf_exempt
+def api_cron_task(request, task_name):
+    """
+    Запуск задачи внешним cron-сервисом (cron-job.org и т.п.).
+
+    Защищен токеном CRON_SECRET (?token=... или заголовок X-Cron-Token).
+    Для history_collector гарантирует, что сборщик запущен (перезапуск после падений).
+    Задачи выполняются в фоне, ответ возвращается сразу.
+    """
+    if request.method not in ('GET', 'POST'):
+        return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+    secret = settings.CRON_SECRET
+    token = request.GET.get('token') or request.headers.get('X-Cron-Token', '')
+
+    if not secret or not hmac.compare_digest(str(token), str(secret)):
+        return JsonResponse({'detail': 'Invalid or missing token'}, status=403)
+
+    if task_name != COLLECTOR_TASK_NAME and task_name not in runner.get_registry():
+        return JsonResponse({'detail': 'Unknown task'}, status=404)
+
+    result = runner.start_task(task_name)
+
+    return JsonResponse(
+        {
+            'ok': True,
+            'task_name': task_name,
+            'task_id': result['task']['id'],
+            'already_running': result['already_running'],
+            'collector_alive': runner.collector_status()['alive'],
         }
     )
 

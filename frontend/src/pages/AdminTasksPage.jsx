@@ -4,10 +4,10 @@ import { Link } from 'react-router-dom'
 import {
   authLogin,
   authMe,
-  fetchCeleryLogs,
-  fetchCeleryOverview,
-  startCeleryTask,
-  stopCeleryTask,
+  fetchTaskLogs,
+  fetchTasksOverview,
+  startBackgroundTask,
+  stopBackgroundTask,
 } from '../api'
 import AdminLoginPanel from '../components/AdminLoginPanel'
 
@@ -21,7 +21,17 @@ function getCachedAdminAuth() {
   return { authenticated, username }
 }
 
-function AdminCeleryTasksPage() {
+function formatRuntime(seconds) {
+  if (!Number.isFinite(seconds)) return 'N/A'
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const secs = seconds % 60
+  if (hours > 0) return `${hours}ч ${minutes}м ${secs}с`
+  if (minutes > 0) return `${minutes}м ${secs}с`
+  return `${secs}с`
+}
+
+function AdminTasksPage() {
   const cachedAuth = getCachedAdminAuth()
   const [authState, setAuthState] = useState({
     loading: true,
@@ -32,7 +42,7 @@ function AdminCeleryTasksPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' })
   const [loginError, setLoginError] = useState('')
 
-  const [overview, setOverview] = useState({ workers: [], running_tasks: [], pending_tasks: [], manual_tasks: [] })
+  const [overview, setOverview] = useState({ collector: null, running_tasks: [], manual_tasks: [], log_sources: ['app'] })
   const [overviewLoading, setOverviewLoading] = useState(true)
   // null — статус ещё не получен, иначе: 'success', 'timeout', 'error'
   const [overviewStatus, setOverviewStatus] = useState(null)
@@ -46,17 +56,11 @@ function AdminCeleryTasksPage() {
   const hasOverviewLoadedRef = useRef(false)
   // Для лампочки статуса: null (ещё не было ответа) — серый, иначе последний статус
   const displayedOverviewStatus = overviewStatus ?? 'none'
-  const workersOnline = useMemo(() => {
-    const directWorkers = Array.isArray(overview.workers) ? overview.workers.length : 0
-    const registeredWorkers = overview.registered_tasks && typeof overview.registered_tasks === 'object'
-      ? Object.keys(overview.registered_tasks).length
-      : 0
-    const statsWorkers = overview.stats && typeof overview.stats === 'object'
-      ? Object.keys(overview.stats).length
-      : 0
-
-    return Math.max(directWorkers, registeredWorkers, statsWorkers)
-  }, [overview])
+  const collector = overview.collector
+  const collectorProgress = useMemo(() => {
+    if (!collector || !collector.progress_total) return null
+    return `${collector.progress_done}/${collector.progress_total}`
+  }, [collector])
 
   useEffect(() => {
     let isActive = true
@@ -103,15 +107,10 @@ function AdminCeleryTasksPage() {
     const fetchOverview = async () => {
       try {
         setOverviewLoading(true)
-        const data = await fetchCeleryOverview()
+        const data = await fetchTasksOverview()
         if (!isActive) return
         setOverview(data)
-        if (data.celery_error) {
-          console.error('[AdminCeleryTasksPage] Celery overview error:', data.celery_error)
-          setOverviewStatus(data.celery_error.toLowerCase().includes('timeout') ? 'timeout' : 'error')
-        } else {
-          setOverviewStatus('success')
-        }
+        setOverviewStatus('success')
         setHasOverviewLoaded(true)
         hasOverviewLoadedRef.current = true
         setOverviewLoading(false)
@@ -120,13 +119,13 @@ function AdminCeleryTasksPage() {
         }
       } catch (error) {
         if (!isActive) return
-        const message = error.message || 'Не удалось получить статус Celery'
+        const message = error.message || 'Не удалось получить статус задач'
         setOverviewStatus(message.toLowerCase().includes('timeout') ? 'timeout' : 'error')
         setOverviewLoading(false)
         if (message.toLowerCase().includes('timeout')) {
-          console.error('[AdminCeleryTasksPage] Request timeout while loading Celery overview')
+          console.error('[AdminTasksPage] Request timeout while loading tasks overview')
         } else {
-          console.error('[AdminCeleryTasksPage] Failed to load Celery overview:', message)
+          console.error('[AdminTasksPage] Failed to load tasks overview:', message)
         }
       } finally {
         if (!isActive) return
@@ -150,7 +149,7 @@ function AdminCeleryTasksPage() {
 
     const fetchLogs = async () => {
       try {
-        const data = await fetchCeleryLogs(logSource, 80)
+        const data = await fetchTaskLogs(logSource, 80)
         if (!isActive) return
         setLogs(data.lines || [])
       } catch {
@@ -168,8 +167,6 @@ function AdminCeleryTasksPage() {
       clearTimeout(timerId)
     }
   }, [isAdmin, hasOverviewLoaded, logSource])
-
-  const runningTaskIds = useMemo(() => new Set((overview.running_tasks || []).map((task) => task.id)), [overview.running_tasks])
 
   const handleLogin = async (event) => {
     event.preventDefault()
@@ -190,20 +187,37 @@ function AdminCeleryTasksPage() {
   const handleStartTask = async () => {
     if (!selectedTask) return
     try {
-      const result = await startCeleryTask(selectedTask)
-      setActionStatus(`Запущена задача ${result.task_name} (${result.task_id})`)
+      const result = await startBackgroundTask(selectedTask)
+      setActionStatus(result.already_running
+        ? `Задача ${result.task_name} уже выполняется (${result.task_id})`
+        : `Запущена задача ${result.task_name} (${result.task_id})`)
     } catch (error) {
-      console.error('[AdminCeleryTasksPage] Failed to start task:', error.message || 'Не удалось запустить задачу')
+      console.error('[AdminTasksPage] Failed to start task:', error.message || 'Не удалось запустить задачу')
     }
   }
 
   const handleStopTask = async (taskId) => {
     try {
-      await stopCeleryTask(taskId, true, 'SIGTERM')
-      setActionStatus(`Задача ${taskId} остановлена`)
+      const result = await stopBackgroundTask(taskId)
+      setActionStatus(`Запрошена остановка задачи ${result.task_name} — завершится на ближайшей контрольной точке`)
     } catch (error) {
-      console.error('[AdminCeleryTasksPage] Failed to stop task:', error.message || 'Не удалось остановить задачу')
+      console.error('[AdminTasksPage] Failed to stop task:', error.message || 'Не удалось остановить задачу')
     }
+  }
+
+  const handleCollectorStart = async () => {
+    if (!overview.collector_task_name) return
+    try {
+      const result = await startBackgroundTask(overview.collector_task_name)
+      setActionStatus(result.already_running ? 'Сборщик уже работает' : 'Сборщик истории запущен')
+    } catch (error) {
+      console.error('[AdminTasksPage] Failed to start collector:', error.message || 'Не удалось запустить сборщик')
+    }
+  }
+
+  const handleCollectorStop = async () => {
+    if (!collector?.task?.id) return
+    await handleStopTask(collector.task.id)
   }
 
   if (authState.loading) {
@@ -213,7 +227,7 @@ function AdminCeleryTasksPage() {
   if (!isAdmin) {
     return (
       <AdminLoginPanel
-        accessTargetText="[M0ДYЛЬ_C3L3RY]"
+        accessTargetText="[M0ДYЛЬ_З4Д4Ч]"
         submitCipherText="X1-7A:П0ДТВ3РДИТЬ"
         username={loginForm.username}
         password={loginForm.password}
@@ -230,9 +244,9 @@ function AdminCeleryTasksPage() {
       <div className="glass-panel p-3">
         <div className="small text-secondary mb-2">
           <Link to="/control-center" className="text-secondary text-decoration-none">Центр управления</Link>
-          {' < Celery Tasks'}
+          {' < Фоновые задачи'}
         </div>
-        <h4 className="mb-0">Celery Tasks</h4>
+        <h4 className="mb-0">Фоновые задачи</h4>
       </div>
 
       <div className="row g-3">
@@ -263,9 +277,7 @@ function AdminCeleryTasksPage() {
 
             <div className="mt-3 d-flex justify-content-between align-items-start gap-2">
               <div>
-                <div className="small text-secondary">Workers online: {workersOnline}</div>
                 <div className="small text-secondary">Running: {overview.running_tasks?.length || 0}</div>
-                <div className="small text-secondary">Pending: {overview.pending_tasks?.length || 0}</div>
               </div>
               <div className="d-flex align-items-center gap-2">
                 <StatusLamp type="status" value={displayedOverviewStatus} />
@@ -279,42 +291,84 @@ function AdminCeleryTasksPage() {
 
         <div className="col-12 col-xl-8">
           <div className="glass-panel p-3 h-100">
-            <h6 className="panel-title mb-3">Активные задачи</h6>
-
-            {overview.running_tasks?.length ? (
-              <div className="d-flex flex-column gap-2">
-                {overview.running_tasks.map((task) => (
-                  <div key={task.id} className="admin-task-row">
-                    <div>
-                      <div className="fw-semibold">{task.name}</div>
-                      <div className="small text-secondary">{task.id}</div>
-                      <div className="small text-secondary">Worker: {task.worker}</div>
-                    </div>
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-outline-danger"
-                      disabled={!runningTaskIds.has(task.id)}
-                      onClick={() => handleStopTask(task.id)}
-                    >
-                      Stop
-                    </button>
-                  </div>
-                ))}
+            <div className="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+              <h6 className="panel-title mb-0">Сборщик истории аукциона</h6>
+              <div className="d-flex gap-2">
+                <button
+                  type="button"
+                  className="btn btn-sm btn-accent"
+                  onClick={handleCollectorStart}
+                  disabled={collector?.alive}
+                >
+                  Запустить
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline-danger"
+                  onClick={handleCollectorStop}
+                  disabled={!collector?.alive}
+                >
+                  Остановить
+                </button>
               </div>
-            ) : (
-              <div className="text-secondary">Сейчас нет активных задач.</div>
+            </div>
+
+            <div className="small text-secondary">Статус: {collector?.alive ? 'работает' : 'остановлен'}</div>
+            {collectorProgress && (
+              <div className="small text-secondary">Прогресс цикла: {collectorProgress}</div>
+            )}
+            <div className="small text-secondary">Циклов завершено: {collector?.cycles_completed ?? 0}</div>
+            {collector?.task && (
+              <div className="small text-secondary">Работает: {formatRuntime(collector.task.runtime_seconds)}</div>
+            )}
+            {collector?.last_cycle_finished_at && (
+              <div className="small text-secondary">Последний цикл завершен: {collector.last_cycle_finished_at}</div>
+            )}
+            {collector?.last_error && (
+              <div className="alert alert-warning mt-2 mb-0 py-2">Последняя ошибка: {collector.last_error}</div>
             )}
           </div>
         </div>
       </div>
 
       <div className="glass-panel p-3">
+        <h6 className="panel-title mb-3">Активные задачи</h6>
+
+        {overview.running_tasks?.length ? (
+          <div className="d-flex flex-column gap-2">
+            {overview.running_tasks.map((task) => (
+              <div key={task.id} className="admin-task-row">
+                <div>
+                  <div className="fw-semibold">{task.name}</div>
+                  <div className="small text-secondary">{task.id}</div>
+                  <div className="small text-secondary">Работает: {formatRuntime(task.runtime_seconds)}</div>
+                  {task.stop_requested && <div className="small text-warning">Останавливается...</div>}
+                </div>
+                {task.stoppable && (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-danger"
+                    disabled={task.stop_requested}
+                    onClick={() => handleStopTask(task.id)}
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-secondary">Сейчас нет активных задач.</div>
+        )}
+      </div>
+
+      <div className="glass-panel p-3">
         <div className="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
           <h6 className="panel-title mb-0">Логи в реальном времени</h6>
           <select className="form-select admin-log-source" value={logSource} onChange={(event) => setLogSource(event.target.value)}>
-            <option value="app">Task logs (app)</option>
-            <option value="worker">Worker logs</option>
-            <option value="beat">Beat logs</option>
+            {(overview.log_sources || ['app']).map((source) => (
+              <option key={source} value={source}>Task logs ({source})</option>
+            ))}
           </select>
         </div>
         <pre className="admin-log-box mb-0">{logs.join('\n') || 'Логи пока пусты'}</pre>
@@ -323,4 +377,4 @@ function AdminCeleryTasksPage() {
   )
 }
 
-export default AdminCeleryTasksPage
+export default AdminTasksPage
