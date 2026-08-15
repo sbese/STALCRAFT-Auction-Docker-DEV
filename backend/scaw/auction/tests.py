@@ -14,21 +14,29 @@ from django.contrib.auth import get_user_model
 from django.test import Client, SimpleTestCase, TestCase, override_settings
 
 from auction import taskrunner
-from auction.taskrunner import COLLECTOR_TASK_NAME, TaskRunner
+from auction.taskrunner import (
+    COLLECTOR_TASK_NAME,
+    LOCK_ACQUIRED,
+    LOCK_BUSY,
+    LOCK_ERROR,
+    PostgresAdvisoryLock,
+    TaskRunner,
+)
 
 
 class FakeLock:
-    """Замена PostgresAdvisoryLock: без базы, всегда доступна."""
+    """Замена PostgresAdvisoryLock: без базы, результат acquire задается в тесте."""
 
-    def __init__(self, acquirable=True):
-        self.acquirable = acquirable
+    def __init__(self, result=LOCK_ACQUIRED, last_error=None):
+        self.result = result
+        self.last_error = last_error
         self.acquired = False
         self.released = False
 
     def try_acquire(self):
-        if self.acquirable:
+        if self.result == LOCK_ACQUIRED:
             self.acquired = True
-        return self.acquirable
+        return self.result
 
     def is_healthy(self):
         return self.acquired
@@ -163,8 +171,8 @@ class TaskRunnerCollectorTests(SimpleTestCase):
 
             self.assertTrue(wait_until(lambda: not runner.running_tasks()))
 
-    def test_collector_waits_in_standby_without_lock(self):
-        runner = make_runner(lock_factory=lambda: FakeLock(acquirable=False))
+    def test_collector_waits_in_standby_when_lock_busy(self):
+        runner = make_runner(lock_factory=lambda: FakeLock(result=LOCK_BUSY))
         cycle = mock.Mock()
 
         with mock.patch('auction.tasks.collect_history_cycle', cycle):
@@ -174,6 +182,53 @@ class TaskRunnerCollectorTests(SimpleTestCase):
                 cycle.assert_not_called()
             finally:
                 runner.stop_task(started['task']['id'])
+
+            self.assertTrue(wait_until(lambda: not runner.running_tasks()))
+
+    def test_collector_reports_lock_error_distinctly_from_standby(self):
+        runner = make_runner(lock_factory=lambda: FakeLock(result=LOCK_ERROR, last_error='connection refused'))
+        cycle = mock.Mock()
+
+        with mock.patch('auction.tasks.collect_history_cycle', cycle):
+            started = runner.ensure_collector_running()
+            try:
+                self.assertTrue(wait_until(lambda: runner.collector_status()['state'] == 'lock_error'))
+                status = runner.collector_status()
+                self.assertEqual(status['last_error'], 'connection refused')
+                cycle.assert_not_called()
+            finally:
+                runner.stop_task(started['task']['id'])
+
+            self.assertTrue(wait_until(lambda: not runner.running_tasks()))
+
+    def test_finishing_old_collector_does_not_clobber_new_owner_state(self):
+        runner = make_runner()
+        wind_down = threading.Event()
+
+        def fake_cycle(stop_event=None, on_progress=None):
+            stop_event.wait(5)
+            wind_down.wait(5)
+
+        with mock.patch('auction.tasks.collect_history_cycle', side_effect=fake_cycle):
+            first = runner.ensure_collector_running()
+            self.assertTrue(wait_until(lambda: runner.collector_status()['state'] == 'collecting'))
+            with runner._lock:
+                first_task = runner._tasks[first['task']['id']]
+
+            runner.stop_task(first['task']['id'])
+            second = runner.ensure_collector_running()
+            self.assertTrue(wait_until(lambda: runner.collector_status()['state'] == 'collecting'))
+
+            # Умирающий поток пытается записать свое состояние - владелец уже сменился
+            runner._update_collector_state_for(first_task, lock_state=None, last_error='stale write')
+
+            status = runner.collector_status()
+            try:
+                self.assertEqual(status['state'], 'collecting')
+                self.assertIsNone(status['last_error'])
+            finally:
+                wind_down.set()
+                runner.stop_task(second['task']['id'])
 
             self.assertTrue(wait_until(lambda: not runner.running_tasks()))
 
@@ -215,7 +270,7 @@ def _stub_runner(collector_status=None):
         'alive': True,
         'state': 'collecting',
         'task': {'id': 'cid'},
-        'lock_acquired': True,
+        'lock_state': LOCK_ACQUIRED,
         'cycles_completed': 1,
         'progress_done': 0,
         'progress_total': 0,
@@ -303,11 +358,63 @@ class HealthEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.content)['status'], 'standby')
 
+    def test_collector_readiness_503_on_lock_infrastructure_error(self):
+        broken = _stub_runner()
+        broken.collector_status.return_value.update({
+            'alive': True,
+            'state': 'lock_error',
+            'last_error': 'connection refused: host db port 5432',
+        })
+        with mock.patch('auction.views.runner', broken):
+            response = self.client.get('/auction/api/health/collector/')
+        self.assertEqual(response.status_code, 503)
+        payload = json.loads(response.content)
+        self.assertEqual(payload['status'], 'lock_error')
+        # Детали ошибки (адреса/учетки БД) не должны утекать в неаутентифицированный эндпоинт
+        self.assertNotIn('connection refused', response.content.decode())
+
     def test_collector_readiness_200_when_collecting(self):
         with mock.patch('auction.views.runner', _stub_runner()):
             response = self.client.get('/auction/api/health/collector/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.content)['status'], 'collecting')
+
+
+class AdvisoryLockIntegrationTests(TestCase):
+    """Реальный pg_try_advisory_lock на тестовой базе PostgreSQL."""
+
+    TEST_LOCK_KEY = 741_852_000  # Отдельный ключ, чтобы не пересекаться с боевым
+
+    def test_mutual_exclusion_and_release(self):
+        first = PostgresAdvisoryLock(self.TEST_LOCK_KEY)
+        second = PostgresAdvisoryLock(self.TEST_LOCK_KEY)
+
+        try:
+            self.assertEqual(first.try_acquire(), LOCK_ACQUIRED)
+            self.assertEqual(second.try_acquire(), LOCK_BUSY)
+
+            first.release()
+            self.assertEqual(second.try_acquire(), LOCK_ACQUIRED)
+        finally:
+            first.release()
+            second.release()
+
+    def test_connection_failure_reported_as_error_not_busy(self):
+        broken = PostgresAdvisoryLock(
+            self.TEST_LOCK_KEY,
+            connect_params={
+                'dbname': 'nope',
+                'user': 'nope',
+                'password': 'nope',
+                'host': '127.0.0.1',
+                'port': '1',  # Закрытый порт: соединение падает сразу
+            },
+        )
+        try:
+            self.assertEqual(broken.try_acquire(), LOCK_ERROR)
+            self.assertIsNotNone(broken.last_error)
+        finally:
+            broken.release()
 
 
 class AdminTasksAuthTests(TestCase):

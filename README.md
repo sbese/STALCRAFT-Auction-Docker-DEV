@@ -151,11 +151,11 @@ X-Cron-Token: <CRON_SECRET>
 
 Health-эндпоинты:
 - `GET /auction/api/health/` - liveness веб-сервера, всегда 200: подходит для keep-alive пингов;
-- `GET /auction/api/health/collector/` - readiness сборщика для мониторинга (UptimeRobot и т.п.): 503, если поток сборщика мертв; `200 standby` - штатное короткое состояние во время деплоя, когда блокировку еще держит старый инстанс.
+- `GET /auction/api/health/collector/` - readiness сборщика для мониторинга (UptimeRobot и т.п.): `503 dead` - поток сборщика мертв; `503 lock_error` - отказ lock-инфраструктуры (например, недоступна база), сбор не идет; `200 standby` - штатное короткое состояние во время деплоя, когда блокировку еще держит старый инстанс; `200 collecting` - все работает.
 
-Одновременная работа двух сборщиков (например, при zero-downtime деплое Render, когда старый и новый инстансы живут параллельно) исключена advisory-блокировкой PostgreSQL: сборщик без блокировки ждет в standby и подхватывает работу, когда держатель умирает.
+Одновременная работа двух сборщиков (например, при zero-downtime деплое Render, когда старый и новый инстансы живут параллельно) исключена advisory-блокировкой PostgreSQL: сборщик без блокировки ждет в standby и подхватывает работу, когда держатель умирает. Штатное ожидание (лок занят) и отказ инфраструктуры (базу не достать) - разные состояния: первое отдает 200, второе - 503.
 
-Тесты бэкенда (`backend/scaw/auction/tests.py`) гоняются в CI на каждый PR ([.github/workflows/backend-tests.yml](.github/workflows/backend-tests.yml)); локально: `docker compose exec backend sh -c "cd scaw && python manage.py test auction"`.
+Тесты бэкенда (`backend/scaw/auction/tests.py`, включая интеграционные тесты advisory-блокировки на реальном PostgreSQL) и сборка фронтенда гоняются в CI на каждый PR ([.github/workflows/ci.yml](.github/workflows/ci.yml)); локально: `docker compose exec backend sh -c "cd scaw && python manage.py test auction"`.
 
 ### Деплой на Render (бесплатный тариф)
 1. Создайте Web Service из этого репозитория (Environment: Docker, Root Directory: `backend`).

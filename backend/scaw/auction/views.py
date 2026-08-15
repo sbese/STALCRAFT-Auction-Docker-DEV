@@ -314,8 +314,12 @@ def api_health_collector(request):
     """
     Readiness сборщика истории для внешнего мониторинга.
 
-    503 - поток сборщика мертв (мониторинг должен поднять тревогу;
-    cron-пинг /api/cron/history_collector/ перезапустит его сам).
+    503 dead - поток сборщика мертв (cron-пинг /api/cron/history_collector/
+    перезапустит его сам, но мониторинг должен видеть провал).
+    503 lock_error - поток жив, но lock-инфраструктура отказала (например,
+    недоступна база): сбор не идет, и не факт, что идет где-то еще.
+    Детали ошибки намеренно не отдаются - эндпоинт без аутентификации,
+    полный текст виден в /api/admin/tasks/overview/ и логах.
     200 collecting - сборщик работает и держит advisory-блокировку.
     200 standby - поток жив, но блокировку держит другой инстанс: штатное
     короткое состояние во время zero-downtime деплоя, тревоги не требует.
@@ -324,6 +328,9 @@ def api_health_collector(request):
 
     if not status['alive']:
         return JsonResponse({'status': 'dead', 'collector_alive': False}, status=503)
+
+    if status['state'] == 'lock_error':
+        return JsonResponse({'status': 'lock_error', 'collector_alive': True}, status=503)
 
     return JsonResponse(
         {
