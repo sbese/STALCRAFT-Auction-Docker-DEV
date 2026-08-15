@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react'
-import { Route, Routes, useNavigate } from 'react-router-dom'
+import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import ItemsPage from './pages/ItemsPage'
 import ItemDetailPage from './pages/ItemDetailPage'
 import UploadLangPage from './pages/UploadLangPage'
 import AppLayout from './components/AppLayout'
 import AdminPage from './pages/AdminPage'
-import AdminCeleryTasksPage from './pages/AdminCeleryTasksPage'
-import AdminCelerySchedulerPage from './pages/AdminCelerySchedulerPage'
+import AdminTasksPage from './pages/AdminTasksPage'
+import AdminSchedulerPage from './pages/AdminSchedulerPage'
 import { authLogout, authMe } from './api'
 
 const ADMIN_AUTH_FLAG_KEY = 'admin-authenticated'
@@ -83,8 +83,10 @@ function App() {
           <Route path="/items/:itemId" element={<ItemDetailPage />} />
           <Route path="/upload-lang" element={<UploadLangPage />} />
           <Route path="/control-center" element={<AdminPage />} />
-          <Route path="/control-center/celery-tasks" element={<AdminCeleryTasksPage />} />
-          <Route path="/control-center/celery-scheduler" element={<AdminCelerySchedulerPage />} />
+          <Route path="/control-center/tasks" element={<AdminTasksPage />} />
+          <Route path="/control-center/scheduler" element={<AdminSchedulerPage />} />
+          <Route path="/control-center/celery-tasks" element={<Navigate to="/control-center/tasks" replace />} />
+          <Route path="/control-center/celery-scheduler" element={<Navigate to="/control-center/scheduler" replace />} />
         </Routes>
     </AppLayout>
   )

@@ -10,7 +10,6 @@ import gzip
 import zlib
 import brotli
 from dotenv import load_dotenv
-from celery import shared_task
 from auction.models import SaleHistory, Item
 from django.utils.dateparse import parse_datetime
 from datetime import timedelta
@@ -39,6 +38,9 @@ GITHUB_HTTP_HEADERS = {
 
 LISTING_FETCH_TIMEOUT_SECONDS = 30
 LISTING_RETRY_DELAY_SECONDS = 20
+LISTING_MAX_ATTEMPTS = 5
+SAVE_HISTORY_MAX_ATTEMPTS = 5
+SAVE_HISTORY_RETRY_DELAY_SECONDS = 20
 
 
 def _decode_response_body(raw_body: bytes, content_encoding: str) -> bytes:
@@ -52,8 +54,8 @@ def _decode_response_body(raw_body: bytes, content_encoding: str) -> bytes:
         return zlib.decompress(raw_body)
     return raw_body
 
-def _load_listing_items_with_retry(url: str) -> list[dict]:
-    while True:
+def _load_listing_items_with_retry(url: str, max_attempts: int = LISTING_MAX_ATTEMPTS) -> list[dict]:
+    for attempt in range(1, max_attempts + 1):
         try:
             response = requests.get(url, headers=GITHUB_HTTP_HEADERS, timeout=LISTING_FETCH_TIMEOUT_SECONDS)
             response.raise_for_status()
@@ -88,10 +90,13 @@ def _load_listing_items_with_retry(url: str) -> list[dict]:
                 save=True,
             )
 
-        time.sleep(LISTING_RETRY_DELAY_SECONDS)
+        if attempt < max_attempts:
+            time.sleep(LISTING_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError(f'Не удалось получить listing за {max_attempts} попыток: {url}')
 
 
-async def get_history(item: Item, session: aiohttp.ClientSession, additional: str = 'false', limit: str = '20', offset: str = '0', region: str = 'RU', total_items: int = None, current_count: int = None) -> dict:
+async def get_history(item: Item, session: aiohttp.ClientSession, additional: str = 'false', limit: str = '20', offset: str = '0', region: str = 'RU', total_items: int = None, current_count: int = None, stop_event=None) -> dict:
     """
     Асинхронно получает историю аукционных цен для заданного предмета.
 
@@ -104,8 +109,9 @@ async def get_history(item: Item, session: aiohttp.ClientSession, additional: st
         region (str): Регион сервера. Пример: "RU", "EU", "NA". По умолчанию "RU".
         total_items (int): Общее количество предметов для логирования прогресса.
         current_count (int): Текущий номер предмета для логирования прогресса.
+        stop_event (threading.Event): Сигнал остановки; при установке ретраи прекращаются.
     Returns:
-        dict: JSON-ответ с историей аукционных цен.
+        dict: JSON-ответ с историей аукционных цен. Пустой dict, если запрошена остановка.
     """
     url = f"https://eapi.stalcraft.net/{region}/auction/{item.item_id}/history"
     params = {
@@ -117,6 +123,8 @@ async def get_history(item: Item, session: aiohttp.ClientSession, additional: st
     prefix = f"[{current_count}/{total_items}] " if current_count and total_items else ""  # Префикс для логов прогресса
 
     while True:  # Бесконечный цикл для повторных попыток при ошибках
+        if stop_event is not None and stop_event.is_set():
+            return {}
         try:
             async with session.get(url, headers=SC_HEADERS, params=params, timeout=21) as response:
                 raw_body = await response.read()
@@ -132,27 +140,29 @@ async def get_history(item: Item, session: aiohttp.ClientSession, additional: st
             await asyncio.sleep(20)
 
 
-@shared_task
-def start_get_history():
+def collect_history_cycle(stop_event=None, on_progress=None):
     """
-    Запускает задачу получения истории аукциона для всех предметов.
+    Выполняет один полный цикл получения истории аукциона для всех предметов.
     Обрабатывает предметы пакетами с параллельными запросами и сохраняет полученные данные.
-    После завершения перезапускает саму себя через 1 секунду.
+    Постоянный повтор циклов обеспечивает TaskRunner (auction/taskrunner.py).
 
     Лимит на ~200 запросов в минуту.
+
+    Arguments:
+        stop_event (threading.Event): Сигнал остановки; проверяется между пакетами.
+        on_progress (callable): Колбэк прогресса on_progress(done, total).
 
     1. Определяет параметры пакетной обработки и параллельных запросов.
     2. Получает общее количество предметов и итерируется по ним пакетами.
     3. Для каждого пакета создает асинхронные задачи для получения истории.
     4. Сохраняет полученные данные в базу данных.
-    5. Логирует время выполнения задачи.
-    6. Перезапускает задачу через 1 секунду после завершения.
-    7. Возвращает True по успешному завершению.
+    5. Логирует время выполнения цикла.
+    6. Возвращает True по успешному завершению.
     """
-    log("START: Задача получения истории аукциона запущена.", save=True)
+    log("START: Цикл получения истории аукциона запущен.", save=True)
 
     time_start = time.time()
-    
+
     parallel_limit = 100  # Количество одновременных запросов
     pause_between_batches = 25  # Пауза между батчами в секундах
 
@@ -160,15 +170,28 @@ def start_get_history():
     total_items = len(items)  # Общее количество предметов
     count = 0  # Счетчик обработанных предметов
 
+    def stop_requested():
+        return stop_event is not None and stop_event.is_set()
+
+    def report_progress():
+        if on_progress is not None:
+            on_progress(count, total_items)
+
+    report_progress()
+
     async def main():  # Асинхронная функция для обработки пакетов предметов
         nonlocal count  # Используем внешний счетчик
-        
+
         async with aiohttp.ClientSession(auto_decompress=False) as session:  # Декодируем ответ вручную, чтобы корректно обрабатывать br/gzip/deflate
             for offset in range(0, total_items, parallel_limit):  # Итерируем по предметам пакетами
+                if stop_requested():  # Кооперативная остановка между пакетами
+                    log("INFO: Цикл получения истории прерван по запросу остановки.", save=True)
+                    return
+
                 sub_batch = items[offset:offset + parallel_limit]  # Текущий пакет предметов
 
                 # Создаем задачи для получения истории
-                tasks = [get_history(item, session, additional='true', limit='200', current_count=count + idx + 1, total_items=total_items) for idx, item in enumerate(sub_batch)]
+                tasks = [get_history(item, session, additional='true', limit='200', current_count=count + idx + 1, total_items=total_items, stop_event=stop_event) for idx, item in enumerate(sub_batch)]
 
                 results = await asyncio.gather(*tasks)  # Выполняем задачи параллельно
 
@@ -177,33 +200,41 @@ def start_get_history():
                     item = sub_batch[idx]  # Соответствующий предмет
                     if 'total' in lots and lots.get('total') != 0:  # Проверяем наличие данных
                         # Создаем задачу для сохранения истории продаж
-                        save_tasks.append(save_sale_history(item, lots.get('prices'), total_items, count + idx + 1))
+                        save_tasks.append(save_sale_history(item, lots.get('prices'), total_items, count + idx + 1, stop_event=stop_event))
                 if save_tasks:  # Если есть задачи для сохранения, выполняем их параллельно
                     await asyncio.gather(*save_tasks)
 
                 count += len(sub_batch)  # Обновляем счетчик обработанных предметов
+                report_progress()
+
+                if stop_requested():  # Не ждем паузу, если запрошена остановка
+                    return
                 await asyncio.sleep(pause_between_batches)  # Пауза между пакетами
 
     asyncio.run(main())  # Запускаем асинхронную функцию
 
-    # Перезапускаем всю задачу через 1 секунд
-    start_get_history.apply_async(countdown=1)
-
-    log(f"FINISH: Задача получения истории аукциона выполнена: {str(timedelta(seconds=time.time() - time_start))}\n", save=True)
+    log(f"FINISH: Цикл получения истории аукциона выполнен: {str(timedelta(seconds=time.time() - time_start))}\n", save=True)
     return True
 
 
-async def save_sale_history(item: Item, lots: list, total_items: int, current_count: int) -> None:
+async def save_sale_history(item: Item, lots: list, total_items: int, current_count: int, stop_event=None) -> None:
     """
     Сохраняет историю продаж для заданного предмета.
+
+    Ретраи ограничены SAVE_HISTORY_MAX_ATTEMPTS: при стойкой ошибке (недоступная
+    БД, некорректные данные) предмет пропускается до следующего цикла, чтобы
+    сборщик не завис в вечном ретрае и мог реагировать на stop_event.
 
     Arguments:
         item (Item): Объект предмета.
         lots (list): Список словарей с данными о продажах.
         total_items (int): Общее количество предметов для логирования прогресса.
         current_count (int): Текущий номер предмета для логирования прогресса.
+        stop_event (threading.Event): Сигнал остановки; при установке ретраи прекращаются.
     """
-    while True:
+    for attempt in range(1, SAVE_HISTORY_MAX_ATTEMPTS + 1):
+        if stop_event is not None and stop_event.is_set():
+            return
         try:
             sale_records_to_create = []
             seen_in_current_batch = set()
@@ -243,11 +274,13 @@ async def save_sale_history(item: Item, lots: list, total_items: int, current_co
                 await sync_to_async(bulk_create_records)()
             break
         except Exception as e:
-            log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}]: {str(e)}', save=True)
-            await asyncio.sleep(20)
+            log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}] (попытка {attempt}/{SAVE_HISTORY_MAX_ATTEMPTS}): {str(e)}', save=True)
+            if attempt >= SAVE_HISTORY_MAX_ATTEMPTS:
+                log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}]: сохранение пропущено до следующего цикла.', save=True)
+                return
+            await asyncio.sleep(SAVE_HISTORY_RETRY_DELAY_SECONDS)
 
 
-@shared_task
 def delete_old_sales():
     """
     Удаляет старые записи о продажах из истории аукциона.
@@ -301,7 +334,6 @@ def delete_old_sales():
     return True
 
 
-@shared_task
 def sync_github_items_daily():
     """
     Синхронизирует предметы из GitHub репозитория STALCRAFT Database.

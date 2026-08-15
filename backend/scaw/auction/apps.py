@@ -6,4 +6,5 @@ class AuctionConfig(AppConfig):
     name = 'auction'
 
     def ready(self):
-        import auction.signals
+        from auction.taskrunner import maybe_autostart_collector
+        maybe_autostart_collector()

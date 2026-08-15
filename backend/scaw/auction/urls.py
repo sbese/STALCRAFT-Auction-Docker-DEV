@@ -16,9 +16,12 @@ urlpatterns = [
     path('api/items/<str:item_id>/', views.api_item_detail, name='api-item-detail'),
     path('api/items/<str:item_id>/sales/', views.api_item_sales, name='api-item-sales'),
     path('api/process-lang/', views.api_process_lang_file, name='api_process_lang'),
-    path('api/admin/celery/overview/', views.api_admin_celery_overview, name='api-admin-celery-overview'),
-    path('api/admin/celery/tasks/start/', views.api_admin_celery_start_task, name='api-admin-celery-start-task'),
-    path('api/admin/celery/tasks/stop/', views.api_admin_celery_stop_task, name='api-admin-celery-stop-task'),
-    path('api/admin/celery/logs/', views.api_admin_celery_logs, name='api-admin-celery-logs'),
+    path('api/admin/tasks/overview/', views.api_admin_tasks_overview, name='api-admin-tasks-overview'),
+    path('api/admin/tasks/start/', views.api_admin_tasks_start, name='api-admin-tasks-start'),
+    path('api/admin/tasks/stop/', views.api_admin_tasks_stop, name='api-admin-tasks-stop'),
+    path('api/admin/tasks/logs/', views.api_admin_tasks_logs, name='api-admin-tasks-logs'),
+    path('api/cron/<str:task_name>/', views.api_cron_task, name='api-cron-task'),
+    path('api/health/', views.api_health, name='api-health'),
+    path('api/health/collector/', views.api_health_collector, name='api-health-collector'),
 
 ]
