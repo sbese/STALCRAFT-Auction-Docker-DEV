@@ -22,5 +22,6 @@ urlpatterns = [
     path('api/admin/tasks/logs/', views.api_admin_tasks_logs, name='api-admin-tasks-logs'),
     path('api/cron/<str:task_name>/', views.api_cron_task, name='api-cron-task'),
     path('api/health/', views.api_health, name='api-health'),
+    path('api/health/collector/', views.api_health_collector, name='api-health-collector'),
 
 ]

@@ -204,7 +204,8 @@ def api_admin_tasks_overview(request):
             'manual_tasks': runner.manual_task_names(),
             'collector_task_name': COLLECTOR_TASK_NAME,
             'schedule': SCHEDULE_HINTS,
-            'cron_url_template': '/auction/api/cron/<task>/?token=<CRON_SECRET>',
+            'cron_url_template': '/auction/api/cron/<task>/',
+            'cron_auth_header': 'X-Cron-Token',
             'log_sources': ['app'],
         }
     )
@@ -294,11 +295,40 @@ def api_admin_tasks_logs(request):
 
 @require_GET
 def api_health(request):
-    """Health-check для мониторинга и keep-alive пингов бесплатного хостинга."""
+    """
+    Liveness веб-сервера: всегда 200, пока процесс отвечает.
+    Используется для keep-alive пингов бесплатного хостинга.
+    Состояние сборщика здесь информационное; для мониторинга сборщика
+    есть отдельный /api/health/collector/.
+    """
     return JsonResponse(
         {
             'status': 'ok',
             'collector_alive': runner.collector_status()['alive'],
+        }
+    )
+
+
+@require_GET
+def api_health_collector(request):
+    """
+    Readiness сборщика истории для внешнего мониторинга.
+
+    503 - поток сборщика мертв (мониторинг должен поднять тревогу;
+    cron-пинг /api/cron/history_collector/ перезапустит его сам).
+    200 collecting - сборщик работает и держит advisory-блокировку.
+    200 standby - поток жив, но блокировку держит другой инстанс: штатное
+    короткое состояние во время zero-downtime деплоя, тревоги не требует.
+    """
+    status = runner.collector_status()
+
+    if not status['alive']:
+        return JsonResponse({'status': 'dead', 'collector_alive': False}, status=503)
+
+    return JsonResponse(
+        {
+            'status': 'standby' if status['state'] == 'waiting_lock' else 'collecting',
+            'collector_alive': True,
         }
     )
 
@@ -308,7 +338,9 @@ def api_cron_task(request, task_name):
     """
     Запуск задачи внешним cron-сервисом (cron-job.org и т.п.).
 
-    Защищен токеном CRON_SECRET (?token=... или заголовок X-Cron-Token).
+    Защищен токеном CRON_SECRET: основной способ - заголовок X-Cron-Token,
+    ?token=... поддерживается как fallback для сервисов без кастомных
+    заголовков (секрет в URL попадает в логи - использовать осознанно).
     Для history_collector гарантирует, что сборщик запущен (перезапуск после падений).
     Задачи выполняются в фоне, ответ возвращается сразу.
     """
@@ -316,7 +348,7 @@ def api_cron_task(request, task_name):
         return JsonResponse({'detail': 'Method not allowed'}, status=405)
 
     secret = settings.CRON_SECRET
-    token = request.GET.get('token') or request.headers.get('X-Cron-Token', '')
+    token = request.headers.get('X-Cron-Token') or request.GET.get('token', '')
 
     if not secret or not hmac.compare_digest(str(token), str(secret)):
         return JsonResponse({'detail': 'Invalid or missing token'}, status=403)

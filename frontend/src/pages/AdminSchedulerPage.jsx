@@ -187,8 +187,10 @@ function AdminSchedulerPage() {
         <h6 className="panel-title mb-3">Периодические задачи (внешний cron)</h6>
         <div className="small text-secondary mb-3">
           Расписание выполняет внешний cron-сервис (например, cron-job.org), который дергает
-          {' '}<code>{overview.cron_url_template || '/auction/api/cron/<task>/?token=<CRON_SECRET>'}</code>.
-          Токен задается переменной окружения <code>CRON_SECRET</code> на сервере.
+          {' '}<code>{overview.cron_url_template || '/auction/api/cron/<task>/'}</code>{' '}
+          с заголовком <code>{overview.cron_auth_header || 'X-Cron-Token'}: &lt;CRON_SECRET&gt;</code>.
+          Токен задается переменной окружения <code>CRON_SECRET</code> на сервере
+          (query-параметр <code>?token=</code> поддерживается как fallback, но секрет в URL попадает в логи).
         </div>
         {scheduleEntries.length ? (
           <div className="d-flex flex-column gap-2">

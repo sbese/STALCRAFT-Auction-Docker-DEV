@@ -39,6 +39,8 @@ GITHUB_HTTP_HEADERS = {
 LISTING_FETCH_TIMEOUT_SECONDS = 30
 LISTING_RETRY_DELAY_SECONDS = 20
 LISTING_MAX_ATTEMPTS = 5
+SAVE_HISTORY_MAX_ATTEMPTS = 5
+SAVE_HISTORY_RETRY_DELAY_SECONDS = 20
 
 
 def _decode_response_body(raw_body: bytes, content_encoding: str) -> bytes:
@@ -198,7 +200,7 @@ def collect_history_cycle(stop_event=None, on_progress=None):
                     item = sub_batch[idx]  # Соответствующий предмет
                     if 'total' in lots and lots.get('total') != 0:  # Проверяем наличие данных
                         # Создаем задачу для сохранения истории продаж
-                        save_tasks.append(save_sale_history(item, lots.get('prices'), total_items, count + idx + 1))
+                        save_tasks.append(save_sale_history(item, lots.get('prices'), total_items, count + idx + 1, stop_event=stop_event))
                 if save_tasks:  # Если есть задачи для сохранения, выполняем их параллельно
                     await asyncio.gather(*save_tasks)
 
@@ -215,17 +217,24 @@ def collect_history_cycle(stop_event=None, on_progress=None):
     return True
 
 
-async def save_sale_history(item: Item, lots: list, total_items: int, current_count: int) -> None:
+async def save_sale_history(item: Item, lots: list, total_items: int, current_count: int, stop_event=None) -> None:
     """
     Сохраняет историю продаж для заданного предмета.
+
+    Ретраи ограничены SAVE_HISTORY_MAX_ATTEMPTS: при стойкой ошибке (недоступная
+    БД, некорректные данные) предмет пропускается до следующего цикла, чтобы
+    сборщик не завис в вечном ретрае и мог реагировать на stop_event.
 
     Arguments:
         item (Item): Объект предмета.
         lots (list): Список словарей с данными о продажах.
         total_items (int): Общее количество предметов для логирования прогресса.
         current_count (int): Текущий номер предмета для логирования прогресса.
+        stop_event (threading.Event): Сигнал остановки; при установке ретраи прекращаются.
     """
-    while True:
+    for attempt in range(1, SAVE_HISTORY_MAX_ATTEMPTS + 1):
+        if stop_event is not None and stop_event.is_set():
+            return
         try:
             sale_records_to_create = []
             seen_in_current_batch = set()
@@ -265,8 +274,11 @@ async def save_sale_history(item: Item, lots: list, total_items: int, current_co
                 await sync_to_async(bulk_create_records)()
             break
         except Exception as e:
-            log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}]: {str(e)}', save=True)
-            await asyncio.sleep(20)
+            log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}] (попытка {attempt}/{SAVE_HISTORY_MAX_ATTEMPTS}): {str(e)}', save=True)
+            if attempt >= SAVE_HISTORY_MAX_ATTEMPTS:
+                log(f'ERROR: [{current_count}/{total_items}] {item.name} [{item.item_id}]: сохранение пропущено до следующего цикла.', save=True)
+                return
+            await asyncio.sleep(SAVE_HISTORY_RETRY_DELAY_SECONDS)
 
 
 def delete_old_sales():

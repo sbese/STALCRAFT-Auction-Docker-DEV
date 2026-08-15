@@ -137,16 +137,25 @@ gunicorn scaw.wsgi:application --bind 0.0.0.0:8000 --workers 1 --threads 8
 - **Синхронизация данных (`sync_github_items_daily`)** - Проверяет наличие новых или обновленных предметов с помощью api запроса `STALCRAFT_DATABASE_LISTING` и сохраняет их в базу данных.
 - **Удаление старых продаж (`delete_old_sales`)** - Чистит устаревшие записи истории продаж.
 
-Периодический запуск выполняет внешний cron-сервис (например, [cron-job.org](https://cron-job.org)) через защищенный эндпоинт:
+Периодический запуск выполняет внешний cron-сервис (например, [cron-job.org](https://cron-job.org)) через защищенный эндпоинт. Токен передается заголовком:
 ```
-GET /auction/api/cron/<task>/?token=<CRON_SECRET>
+GET /auction/api/cron/<task>/
+X-Cron-Token: <CRON_SECRET>
 ```
+(Query-параметр `?token=<CRON_SECRET>` поддерживается как fallback для cron-сервисов без кастомных заголовков, но секрет в URL попадает в access-логи - используйте заголовок, где возможно.)
+
 Рекомендуемое расписание:
 - `sync_github_items_daily` - ежедневно в 16:00 UTC (`0 16 * * *`);
 - `delete_old_sales` - по понедельникам в 03:00 UTC (`0 3 * * 1`);
 - `history_collector` - каждые 10 минут (`*/10 * * * *`): пинг не дает бесплатному хостингу заснуть и перезапускает сборщик, если тот упал.
 
-Для проверки состояния есть эндпоинт `GET /auction/api/health/` (отдает статус сборщика, подходит для UptimeRobot).
+Health-эндпоинты:
+- `GET /auction/api/health/` - liveness веб-сервера, всегда 200: подходит для keep-alive пингов;
+- `GET /auction/api/health/collector/` - readiness сборщика для мониторинга (UptimeRobot и т.п.): 503, если поток сборщика мертв; `200 standby` - штатное короткое состояние во время деплоя, когда блокировку еще держит старый инстанс.
+
+Одновременная работа двух сборщиков (например, при zero-downtime деплое Render, когда старый и новый инстансы живут параллельно) исключена advisory-блокировкой PostgreSQL: сборщик без блокировки ждет в standby и подхватывает работу, когда держатель умирает.
+
+Тесты бэкенда (`backend/scaw/auction/tests.py`) гоняются в CI на каждый PR ([.github/workflows/backend-tests.yml](.github/workflows/backend-tests.yml)); локально: `docker compose exec backend sh -c "cd scaw && python manage.py test auction"`.
 
 ### Деплой на Render (бесплатный тариф)
 1. Создайте Web Service из этого репозитория (Environment: Docker, Root Directory: `backend`).

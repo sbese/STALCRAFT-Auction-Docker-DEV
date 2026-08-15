@@ -313,7 +313,11 @@ function AdminTasksPage() {
               </div>
             </div>
 
-            <div className="small text-secondary">Статус: {collector?.alive ? 'работает' : 'остановлен'}</div>
+            <div className="small text-secondary">
+              Статус: {collector?.alive
+                ? (collector?.state === 'waiting_lock' ? 'standby (блокировку держит другой инстанс)' : 'работает')
+                : 'остановлен'}
+            </div>
             {collectorProgress && (
               <div className="small text-secondary">Прогресс цикла: {collectorProgress}</div>
             )}

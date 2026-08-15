@@ -25,16 +25,17 @@ if not User.objects.filter(username=username).exists():
     User.objects.create_superuser(username=username, password=password)
 PY
 
-# Сборщик истории стартует фоновым потоком внутри веб-процесса (auction/taskrunner.py).
-# Переменная выставляется только здесь, чтобы manage.py-команды выше его не запускали.
-export COLLECTOR_AUTOSTART=${COLLECTOR_AUTOSTART:-1}
-
 # На Render (или при USE_GUNICORN=1) запускаем прод-сервер.
 # ВАЖНО: ровно 1 worker - раннер фоновых задач живет внутри процесса,
 # несколько воркеров запустят несколько сборщиков.
+# COLLECTOR_AUTOSTART экспортируется строго после всех manage.py-команд
+# (migrate/collectstatic тоже поднимают Django apps и иначе запустили бы
+# сборщик внутри одноразовой команды) и непосредственно перед exec сервера.
 if [ -n "$RENDER" ] || [ "$USE_GUNICORN" = "1" ]; then
     python manage.py collectstatic --noinput
+    export COLLECTOR_AUTOSTART=${COLLECTOR_AUTOSTART:-1}
     exec gunicorn scaw.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 8 --timeout 120
 else
+    export COLLECTOR_AUTOSTART=${COLLECTOR_AUTOSTART:-1}
     exec python manage.py runserver 0.0.0.0:8000
 fi
